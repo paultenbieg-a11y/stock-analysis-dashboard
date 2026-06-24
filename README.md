@@ -95,6 +95,14 @@ reports/AAPL_stock_analysis.html
 
 Open that HTML file in a browser to use the interactive charts.
 
+Generated report files are intentionally ignored by Git. The `reports` folder stays in the project through `reports/.gitkeep`, but past analysis outputs stay local on your Mac and are not pushed to GitHub.
+
+## Currency Handling
+
+The report separates the market quote currency from the financial statement currency.
+
+Example: an ADR can trade in USD while the company's annual statements are reported in EUR. In that case, the report still shows the annual statements, but currency-sensitive ratios and the DCF price comparison are handled cautiously or shown as `n/a` instead of forcing a misleading comparison.
+
 ## Investor Relations Link
 
 The report tries to link the company name in the hero section to an investor-relations page.

@@ -44,9 +44,10 @@ except ImportError as exc:  # pragma: no cover - friendly runtime failure
 # Manual input area
 # ---------------------------------------------------------------------------
 
-DEFAULT_TICKER = " TSLA"
+DEFAULT_TICKER = "TSLA"
 DEFAULT_PERIOD = "5y"
 DEFAULT_INTERVAL = "1d"
+REQUIRED_HISTORY_COLUMNS = {"Open", "High", "Low", "Close"}
 
 # Optional manual overrides for investor-relations links when Yahoo only returns
 # a generic corporate website. The report still works for any ticker without
@@ -65,7 +66,7 @@ class ReportConfig:
     risk_free_rate: float = 0.045
     market_return: float = 0.085
     terminal_growth: float = 0.025
-    forecast_years: int = 3
+    forecast_years: int = 5
     monte_carlo_paths: int = 250
     monte_carlo_days: int = 252
 
@@ -118,28 +119,65 @@ def flatten_columns(data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
+def clean_currency(value: Any, fallback: str = "USD") -> str:
+    try:
+        if pd.isna(value):
+            return fallback
+    except (TypeError, ValueError):
+        pass
+    if value is None:
+        return fallback
+    text = str(value).strip().upper() if value is not None else ""
+    if text in {"", "NAN", "NONE"}:
+        return fallback
+    return text or fallback
+
+
+def same_currency(left: str, right: str) -> bool:
+    return clean_currency(left, "") == clean_currency(right, "")
+
+
+def safe_yfinance_frame(ticker: yf.Ticker, attr: str, label: str, warnings: list[str]) -> pd.DataFrame:
+    try:
+        data = getattr(ticker, attr)
+    except Exception:
+        warnings.append(f"{label} was unavailable from Yahoo Finance.")
+        return pd.DataFrame()
+    if isinstance(data, pd.DataFrame):
+        return data
+    warnings.append(f"{label} returned an unexpected data shape.")
+    return pd.DataFrame()
+
+
 def fetch_data(config: ReportConfig) -> dict[str, Any]:
+    warnings = []
     ticker = yf.Ticker(config.ticker)
     history = ticker.history(period=config.period, interval=config.interval, auto_adjust=False)
     history = flatten_columns(history)
     if history.empty:
         raise RuntimeError(f"No price history returned for ticker {config.ticker!r}.")
 
+    missing_columns = REQUIRED_HISTORY_COLUMNS - set(history.columns)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise RuntimeError(f"Price history is missing required columns: {missing}.")
+    if "Volume" not in history.columns:
+        history["Volume"] = 0
+        warnings.append("Volume data was unavailable, so volume-based indicators use zero volume.")
+
     financials = {
-        "income": ticker.financials,
-        "balance": ticker.balance_sheet,
-        "cashflow": ticker.cashflow,
-        "quarterly_income": ticker.quarterly_financials,
-        "quarterly_balance": ticker.quarterly_balance_sheet,
-        "quarterly_cashflow": ticker.quarterly_cashflow,
+        "income": safe_yfinance_frame(ticker, "financials", "Annual income statement", warnings),
+        "balance": safe_yfinance_frame(ticker, "balance_sheet", "Annual balance sheet", warnings),
+        "cashflow": safe_yfinance_frame(ticker, "cashflow", "Annual cash flow statement", warnings),
     }
 
     try:
         info = ticker.info or {}
     except Exception:
         info = {}
+        warnings.append("Company profile data was unavailable from Yahoo Finance.")
 
-    return {"ticker": ticker, "history": history, "financials": financials, "info": info}
+    return {"ticker": ticker, "history": history, "financials": financials, "info": info, "warnings": warnings}
 
 
 def add_technical_indicators(data: pd.DataFrame) -> pd.DataFrame:
@@ -219,6 +257,9 @@ def calculate_fundamentals(info: dict[str, Any], financials: dict[str, pd.DataFr
     balance = financials.get("balance", pd.DataFrame())
     cashflow = financials.get("cashflow", pd.DataFrame())
 
+    quote_currency = clean_currency(info.get("currency"))
+    financial_currency = clean_currency(info.get("financialCurrency"), quote_currency)
+    currencies_comparable = same_currency(quote_currency, financial_currency)
     market_cap = safe_float(info.get("marketCap"))
     enterprise_value = safe_float(info.get("enterpriseValue"))
     price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
@@ -272,10 +313,13 @@ def calculate_fundamentals(info: dict[str, Any], financials: dict[str, pd.DataFr
         "peg": safe_float(info.get("pegRatio")),
         "price_to_book": safe_float(info.get("priceToBook")),
         "price_to_sales": safe_float(info.get("priceToSalesTrailing12Months")),
-        "ev_to_revenue": enterprise_value / revenue if revenue else np.nan,
-        "ev_to_ebitda": enterprise_value / ebitda if ebitda else np.nan,
-        "fcf_yield": free_cash_flow / market_cap if market_cap else np.nan,
-        "earnings_yield": net_income / market_cap if market_cap else np.nan,
+        "quote_currency": quote_currency,
+        "financial_currency": financial_currency,
+        "currencies_comparable": currencies_comparable,
+        "ev_to_revenue": enterprise_value / revenue if currencies_comparable and revenue else np.nan,
+        "ev_to_ebitda": enterprise_value / ebitda if currencies_comparable and ebitda else np.nan,
+        "fcf_yield": free_cash_flow / market_cap if currencies_comparable and market_cap else np.nan,
+        "earnings_yield": net_income / market_cap if currencies_comparable and market_cap else np.nan,
         "gross_margin": gross_margin,
         "operating_margin": operating_margin,
         "net_margin": net_margin,
@@ -365,12 +409,22 @@ def piotroski_score(
     return score
 
 
-def dcf_valuation(ratios: dict[str, float], config: ReportConfig) -> dict[str, float]:
+def dcf_valuation(ratios: dict[str, Any], config: ReportConfig) -> dict[str, Any]:
     fcf = safe_float(ratios.get("free_cash_flow"))
     shares = safe_float(ratios.get("shares"))
     beta = safe_float(ratios.get("beta"), 1.0)
+    quote_currency = clean_currency(ratios.get("quote_currency"))
+    financial_currency = clean_currency(ratios.get("financial_currency"), quote_currency)
+    currencies_comparable = bool(ratios.get("currencies_comparable"))
     if np.isnan(fcf) or fcf <= 0 or np.isnan(shares) or shares <= 0:
-        return {"fair_value": np.nan, "wacc_proxy": np.nan, "base_growth": np.nan}
+        return {
+            "fair_value": np.nan,
+            "wacc_proxy": np.nan,
+            "base_growth": np.nan,
+            "quote_currency": quote_currency,
+            "financial_currency": financial_currency,
+            "comparable_to_price": currencies_comparable,
+        }
 
     revenue_growth = safe_float(ratios.get("revenue_growth"), 0.03)
     earnings_growth = safe_float(ratios.get("earnings_growth"), revenue_growth)
@@ -400,6 +454,9 @@ def dcf_valuation(ratios: dict[str, float], config: ReportConfig) -> dict[str, f
         "base_growth": base_growth,
         "terminal_growth": terminal_growth,
         "equity_value": equity_value,
+        "quote_currency": quote_currency,
+        "financial_currency": financial_currency,
+        "comparable_to_price": currencies_comparable,
     }
 
 
@@ -441,6 +498,8 @@ def monte_carlo(df: pd.DataFrame, config: ReportConfig) -> pd.DataFrame:
         return pd.DataFrame()
     mu = returns.mean()
     sigma = returns.std()
+    if np.isnan(mu) or np.isnan(sigma) or sigma <= 0:
+        return pd.DataFrame()
     rng = np.random.default_rng(42)
     shocks = rng.normal(
         loc=mu - 0.5 * sigma**2,
@@ -466,44 +525,59 @@ def technical_read(df: pd.DataFrame, currency: str) -> dict[str, str]:
     bb_lower = latest(df["BB_Lower"])
 
     trend_parts = []
-    if close > sma_200 and sma_50 > sma_200:
+    if np.isnan(close) or np.isnan(sma_50) or np.isnan(sma_200):
+        trend_parts.append("long-term trend is unavailable because the selected history is too short or incomplete")
+    elif close > sma_200 and sma_50 > sma_200:
         trend_parts.append("primary uptrend: price and 50-day average are above the 200-day average")
     elif close < sma_200 and sma_50 < sma_200:
         trend_parts.append("primary downtrend: price and 50-day average are below the 200-day average")
     else:
         trend_parts.append("transitional trend: moving averages are not aligned")
 
-    if close > sma_20 > sma_50:
+    if np.isnan(close) or np.isnan(sma_20) or np.isnan(sma_50):
+        trend_parts.append("short-term momentum is unavailable")
+    elif close > sma_20 > sma_50:
         trend_parts.append("short-term momentum is constructive")
     elif close < sma_20 < sma_50:
         trend_parts.append("short-term momentum is weak")
     else:
         trend_parts.append("short-term momentum is mixed")
 
-    if rsi >= 70:
+    if np.isnan(rsi):
+        oscillator = "RSI is unavailable because the selected history is too short or incomplete."
+    elif rsi >= 70:
         oscillator = "RSI is overbought; trend can persist, but upside risk/reward is less asymmetric."
     elif rsi <= 30:
         oscillator = "RSI is oversold; mean-reversion probability is elevated if fundamentals are intact."
     else:
         oscillator = "RSI is neutral, so price action is not at a classic oscillator extreme."
 
-    macd_text = "MACD is above signal, showing positive momentum." if macd > macd_signal else "MACD is below signal, showing fading momentum."
+    if np.isnan(macd) or np.isnan(macd_signal):
+        macd_text = "MACD is unavailable because the selected history is too short or incomplete."
+    else:
+        macd_text = "MACD is above signal, showing positive momentum." if macd > macd_signal else "MACD is below signal, showing fading momentum."
     trend_strength = (
         "ADX indicates a strong directional regime."
-        if adx >= 25
+        if not np.isnan(adx) and adx >= 25
         else "ADX indicates a weaker or range-bound directional regime."
+        if not np.isnan(adx)
+        else "ADX is unavailable because the selected history is too short or incomplete."
     )
-    range_text = (
-        f"One ATR is about {money(atr, currency)}, making an approximate volatility band of "
-        f"{money(close - atr, currency)} to {money(close + atr, currency)} around the last close."
-    )
-    bollinger = (
-        "Price is pressing the upper Bollinger Band, often a sign of trend strength or short-term stretch."
-        if close >= bb_upper
-        else "Price is pressing the lower Bollinger Band, often a sign of capitulation or short-term weakness."
-        if close <= bb_lower
-        else "Price sits inside its Bollinger envelope."
-    )
+    if np.isnan(close) or np.isnan(atr):
+        range_text = "ATR volatility band is unavailable because the selected history is too short or incomplete."
+    else:
+        range_text = (
+            f"One ATR is about {money(atr, currency)}, making an approximate volatility band of "
+            f"{money(close - atr, currency)} to {money(close + atr, currency)} around the last close."
+        )
+    if np.isnan(close) or np.isnan(bb_upper) or np.isnan(bb_lower):
+        bollinger = "Bollinger Band position is unavailable because the selected history is too short or incomplete."
+    elif close >= bb_upper:
+        bollinger = "Price is pressing the upper Bollinger Band, often a sign of trend strength or short-term stretch."
+    elif close <= bb_lower:
+        bollinger = "Price is pressing the lower Bollinger Band, often a sign of capitulation or short-term weakness."
+    else:
+        bollinger = "Price sits inside its Bollinger envelope."
 
     return {
         "trend": "; ".join(trend_parts) + ".",
@@ -515,28 +589,43 @@ def technical_read(df: pd.DataFrame, currency: str) -> dict[str, str]:
     }
 
 
-def fundamental_read(ratios: dict[str, float], valuation: dict[str, float], currency: str) -> dict[str, str]:
-    fcf_yield = safe_float(ratios.get("fcf_yield"))
+def fundamental_read(ratios: dict[str, Any], valuation: dict[str, Any], quote_currency: str, financial_currency: str) -> dict[str, str]:
     roe = safe_float(ratios.get("roe"))
     debt_to_equity = safe_float(ratios.get("debt_to_equity"))
     revenue_growth = safe_float(ratios.get("revenue_growth"))
     fair_value = safe_float(valuation.get("fair_value"))
     price = safe_float(ratios.get("price"))
     piotroski = ratios.get("piotroski_score")
+    comparable_to_price = bool(valuation.get("comparable_to_price"))
 
     quality = []
-    quality.append(
-        "high return on equity" if roe >= 0.18 else "acceptable return on equity" if roe >= 0.10 else "modest return on equity"
-    )
-    quality.append(
-        "conservative leverage" if debt_to_equity < 0.8 else "meaningful leverage" if debt_to_equity < 2.0 else "high leverage"
-    )
-    quality.append(
-        "positive revenue growth" if revenue_growth > 0 else "contracting revenue" if revenue_growth < 0 else "flat revenue growth"
-    )
+    if np.isnan(roe):
+        quality.append("unavailable return-on-equity data")
+    else:
+        quality.append(
+            "high return on equity" if roe >= 0.18 else "acceptable return on equity" if roe >= 0.10 else "modest return on equity"
+        )
+    if np.isnan(debt_to_equity):
+        quality.append("unavailable leverage data")
+    else:
+        quality.append(
+            "conservative leverage" if debt_to_equity < 0.8 else "meaningful leverage" if debt_to_equity < 2.0 else "high leverage"
+        )
+    if np.isnan(revenue_growth):
+        quality.append("unavailable revenue-growth data")
+    else:
+        quality.append(
+            "positive revenue growth" if revenue_growth > 0 else "contracting revenue" if revenue_growth < 0 else "flat revenue growth"
+        )
 
     valuation_text = "DCF could not be estimated because free cash flow or share count is unavailable."
-    if not np.isnan(fair_value) and not np.isnan(price) and price > 0:
+    if not np.isnan(fair_value) and not comparable_to_price:
+        valuation_text = (
+            f"DCF fair value is {money(fair_value, financial_currency)} in the financial statement currency. "
+            f"It is not compared with the quoted share price because the quote currency is {quote_currency} "
+            f"while the financial statements are reported in {financial_currency}."
+        )
+    elif not np.isnan(fair_value) and not np.isnan(price) and price > 0:
         gap = fair_value / price - 1
         if gap > 0.15:
             stance = "undervalued under the base assumptions"
@@ -544,7 +633,7 @@ def fundamental_read(ratios: dict[str, float], valuation: dict[str, float], curr
             stance = "overvalued under the base assumptions"
         else:
             stance = "roughly fairly valued under the base assumptions"
-        valuation_text = f"DCF fair value is {money(fair_value, currency)} versus price {money(price, currency)}, implying {pct(gap)} upside/downside and appearing {stance}."
+        valuation_text = f"DCF fair value is {money(fair_value, quote_currency)} versus price {money(price, quote_currency)}, implying {pct(gap)} upside/downside and appearing {stance}."
 
     score_text = (
         "Piotroski F-score could not be computed from available statements."
@@ -559,31 +648,37 @@ def fundamental_read(ratios: dict[str, float], valuation: dict[str, float], curr
     }
 
 
-def scenario_table(df: pd.DataFrame, ratios: dict[str, float], valuation: dict[str, float], currency: str) -> pd.DataFrame:
+def scenario_table(df: pd.DataFrame, ratios: dict[str, Any], valuation: dict[str, Any], currency: str) -> pd.DataFrame:
     last_price = latest(df["Close"])
     atr = latest(df["ATR_14"])
     sma_200 = latest(df["SMA_200"])
     fair_value = safe_float(valuation.get("fair_value"))
+    comparable_to_price = bool(valuation.get("comparable_to_price"))
     annual_vol = df["Return"].dropna().std() * np.sqrt(252)
-    vol_move = last_price * annual_vol if not np.isnan(annual_vol) else np.nan
+    vol_move = last_price * annual_vol if not np.isnan(last_price) and not np.isnan(annual_vol) else np.nan
+    bull_reference = last_price + vol_move * 0.5 if not np.isnan(vol_move) else last_price
+    base_reference = fair_value if comparable_to_price and not np.isnan(fair_value) else last_price
+    if comparable_to_price and not np.isnan(fair_value) and not np.isnan(bull_reference):
+        bull_reference = max(bull_reference, fair_value)
+    bear_reference = min(sma_200, last_price - 2 * atr) if not np.isnan(sma_200) and not np.isnan(atr) else last_price
 
     rows = [
         {
             "Scenario": "Bull case",
             "Trigger": "Price holds above rising 50/200-day averages; earnings revisions and cash flow trend improve.",
-            "Reference Level": money(max(last_price + vol_move * 0.5, fair_value) if not np.isnan(fair_value) else last_price + vol_move * 0.5, currency),
+            "Reference Level": money(bull_reference, currency),
             "Interpretation": "Momentum and fundamentals align; valuation can re-rate if growth durability improves.",
         },
         {
             "Scenario": "Base case",
             "Trigger": "Price mean-reverts around trend while fundamentals evolve near current consensus.",
-            "Reference Level": money(fair_value if not np.isnan(fair_value) else last_price, currency),
+            "Reference Level": money(base_reference, currency),
             "Interpretation": "Expected return depends mainly on earnings delivery, buybacks/dividends, and multiple stability.",
         },
         {
             "Scenario": "Bear case",
             "Trigger": "Break below 200-day trend or deterioration in margins, balance sheet, or cash conversion.",
-            "Reference Level": money(min(sma_200, last_price - 2 * atr) if not np.isnan(sma_200) else last_price - 2 * atr, currency),
+            "Reference Level": money(bear_reference, currency),
             "Interpretation": "Technical damage can amplify fundamental disappointment through multiple compression.",
         },
     ]
@@ -1136,6 +1231,27 @@ def company_overview_html(info: dict[str, Any], ticker: str, company: str, ir_ur
     """
 
 
+def data_notes_html(notes: list[str]) -> str:
+    clean_notes = []
+    seen = set()
+    for note in notes:
+        text = compact_text(note)
+        if text and text not in seen:
+            clean_notes.append(text)
+            seen.add(text)
+
+    if not clean_notes:
+        return ""
+
+    items = "".join(f"<li>{escape(note)}</li>" for note in clean_notes)
+    return f"""
+      <section class="data-notes">
+        <h2>Data Notes</h2>
+        <ul>{items}</ul>
+      </section>
+    """
+
+
 def safe_output_filename(ticker: str) -> str:
     safe_chars = []
     for char in ticker.upper():
@@ -1146,43 +1262,60 @@ def safe_output_filename(ticker: str) -> str:
 def build_report(config: ReportConfig, data: dict[str, Any]) -> Path:
     info = data["info"]
     df = add_technical_indicators(data["history"]).dropna(subset=["Close"])
+    if df.empty:
+        raise RuntimeError("Price history did not contain valid closing prices.")
     ratios = calculate_fundamentals(info, data["financials"])
     valuation = dcf_valuation(ratios, config)
     risk = risk_metrics(df)
 
     ticker = config.ticker.upper()
     company = info.get("longName") or info.get("shortName") or ticker
-    currency = info.get("currency") or "USD"
-    tech = technical_read(df, currency)
-    fund = fundamental_read(ratios, valuation, currency)
-    scenarios = scenario_table(df, ratios, valuation, currency)
+    quote_currency = clean_currency(ratios.get("quote_currency"))
+    financial_currency = clean_currency(ratios.get("financial_currency"), quote_currency)
+    currencies_comparable = same_currency(quote_currency, financial_currency)
+    tech = technical_read(df, quote_currency)
+    fund = fundamental_read(ratios, valuation, quote_currency, financial_currency)
+    scenarios = scenario_table(df, ratios, valuation, quote_currency)
     paths = monte_carlo(df, config)
     ir_url, ir_label = investor_relations_target(info, ticker, company)
     company_overview = company_overview_html(info, ticker, company, ir_url, ir_label)
+    data_notes = list(data.get("warnings", []))
+    if not currencies_comparable:
+        data_notes.append(
+            f"Quote currency is {quote_currency}, while financial statements are reported in {financial_currency}. "
+            "Currency-sensitive valuation ratios and DCF price comparison are therefore shown cautiously or marked n/a."
+        )
+    data_notes_section = data_notes_html(data_notes)
     last_close = latest(df["Close"])
     first_close = df["Close"].dropna().iloc[0]
     period_return = last_close / first_close - 1
     fair_value = safe_float(valuation.get("fair_value"))
-    dcf_gap = fair_value / last_close - 1 if not np.isnan(fair_value) and last_close else np.nan
+    dcf_comparable = bool(valuation.get("comparable_to_price"))
+    dcf_gap = fair_value / last_close - 1 if dcf_comparable and not np.isnan(fair_value) and last_close else np.nan
+    dcf_currency = quote_currency if dcf_comparable else financial_currency
+    dcf_detail = f"{pct(dcf_gap)} vs price" if dcf_comparable and not np.isnan(dcf_gap) else "not price-comparable"
 
     technical_html = line_chart(df, ticker)
-    annual_statements_html = annual_statement_section_html(data["financials"], currency)
+    annual_statements_html = annual_statement_section_html(data["financials"], financial_currency)
     risk_html = risk_chart(df)
     monte_carlo_html = monte_carlo_chart(paths, last_close)
 
     metrics = [
-        metric_card("Last close", money(last_close, currency), currency),
-        metric_card("Market cap", human_number(ratios.get("market_cap")), currency),
+        metric_card("Last close", money(last_close, quote_currency), quote_currency),
+        metric_card("Market cap", human_number(ratios.get("market_cap")), quote_currency),
         metric_card("Period return", pct(period_return), config.period),
         metric_card("Annual volatility", pct(risk.get("annual_volatility")), "realized"),
         metric_card("Max drawdown", pct(risk.get("max_drawdown")), "history"),
-        metric_card("DCF fair value", money(fair_value, currency), f"{pct(dcf_gap)} vs price"),
+        metric_card("DCF fair value", money(fair_value, dcf_currency), dcf_detail),
         metric_card("FCF yield", pct(ratios.get("fcf_yield")), "cash return"),
         metric_card("Piotroski", "n/a" if ratios.get("piotroski_score") is None else f"{ratios.get('piotroski_score')}/9", "quality score"),
     ]
 
     valuation_table = pd.DataFrame(
         [
+            ["Quote currency", quote_currency],
+            ["Financial statement currency", financial_currency],
+            ["DCF price comparison", "available" if dcf_comparable else "not available: currency mismatch"],
             ["Trailing P/E", f"{safe_float(ratios.get('trailing_pe')):.2f}" if not np.isnan(safe_float(ratios.get("trailing_pe"))) else "n/a"],
             ["Forward P/E", f"{safe_float(ratios.get('forward_pe')):.2f}" if not np.isnan(safe_float(ratios.get("forward_pe"))) else "n/a"],
             ["PEG", f"{safe_float(ratios.get('peg')):.2f}" if not np.isnan(safe_float(ratios.get("peg"))) else "n/a"],
@@ -1198,6 +1331,7 @@ def build_report(config: ReportConfig, data: dict[str, Any]) -> Path:
 
     quality_table = pd.DataFrame(
         [
+            ["Statement currency", financial_currency],
             ["Revenue", human_number(ratios.get("revenue"))],
             ["Net income", human_number(ratios.get("net_income"))],
             ["Free cash flow", human_number(ratios.get("free_cash_flow"))],
@@ -1315,6 +1449,9 @@ def build_report(config: ReportConfig, data: dict[str, Any]) -> Path:
     .profile-link-row {{ display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 10px; margin: 14px 0 0; color: #cbd5e1; overflow-wrap: anywhere; }}
     .profile-link-row span {{ color: var(--muted); }}
     .profile-link-row a {{ color: #93c5fd; }}
+    .data-notes {{ border-color: rgba(245,158,11,.36); background: rgba(120,53,15,.18); }}
+    .data-notes ul {{ margin: 0; padding-left: 20px; color: #fde68a; line-height: 1.55; }}
+    .data-notes li + li {{ margin-top: 8px; }}
     .statement-stack {{ display: grid; gap: 28px; margin-top: 24px; }}
     .statement-panel {{ padding: 24px; border: 1px solid rgba(148,163,184,.18); border-radius: 18px; background: rgba(2,6,23,.34); }}
     .statement-heading {{ display: flex; justify-content: space-between; gap: 22px; align-items: end; margin-bottom: 16px; }}
@@ -1376,7 +1513,8 @@ def build_report(config: ReportConfig, data: dict[str, Any]) -> Path:
           <span class="tag">Generated {datetime.now().strftime("%Y-%m-%d %H:%M")}</span>
           <span class="tag">Period {config.period}</span>
           <span class="tag">Interval {config.interval}</span>
-          <span class="tag">Currency {currency}</span>
+          <span class="tag">Quote currency {quote_currency}</span>
+          <span class="tag">Financials {financial_currency}</span>
         </div>
         <h1><a class="company-link" href="{ir_url_html}" target="_blank" rel="noopener noreferrer" title="{ir_label_html}">{company_html}</a><br><span style="color:#38bdf8">{ticker_html}</span></h1>
         <p>Institutional-style research dashboard combining financial statement quality, valuation theory, price trend structure, volatility, drawdown, and scenario analysis.</p>
@@ -1389,6 +1527,8 @@ def build_report(config: ReportConfig, data: dict[str, Any]) -> Path:
     </div>
 
     {company_overview}
+
+    {data_notes_section}
 
     <section>
       <h2>Executive View</h2>

@@ -33,6 +33,20 @@ reports/<TICKER>_stock_analysis.html
 
 The file is self-contained except for Plotly being loaded from a CDN for interactive charts. Open it in a browser.
 
+Generated report files are local outputs. The project keeps the `reports` folder with `reports/.gitkeep`, but ignores generated `.html` reports in Git so old personal analyses are not published when the repository is pushed.
+
+## Data Notes
+
+The HTML report can include a `Data Notes` section near the top.
+
+This section appears when the script detects important caveats, such as:
+
+- Yahoo Finance did not return a statement or company profile field.
+- Volume data was unavailable.
+- The quote currency differs from the financial statement currency.
+
+These notes do not always mean the report is unusable. They show where a calculation needs extra caution or outside verification.
+
 ## Ticker Flexibility
 
 The project is designed to analyze whichever ticker you enter manually in `DEFAULT_TICKER` or pass with `--ticker`.
@@ -46,6 +60,22 @@ Examples:
 - `NESN.SW` for Nestle in Switzerland.
 
 The report adapts to the company data returned by Yahoo Finance. If a field is unavailable for a ticker, the report shows `n/a` or an explanatory note instead of forcing a company-specific assumption.
+
+## Currency Handling
+
+The report separates:
+
+- Quote currency: the currency in which the stock trades.
+- Financial statement currency: the currency used in annual income statement, balance sheet, and cash flow statement data.
+
+For many tickers these are the same. For ADRs, foreign listings, and cross-listed shares, they can differ.
+
+When the currencies differ, the report avoids direct price comparisons that would be misleading without exchange-rate and share-class adjustments. In that case:
+
+- Annual financial statements are still shown in the financial statement currency.
+- Market price and technical levels are shown in the quote currency.
+- Currency-sensitive valuation ratios may show `n/a`.
+- DCF fair value is shown in the financial statement currency and marked as not price-comparable.
 
 ## Executive View
 
@@ -562,6 +592,12 @@ Interpretation:
 - Fair value below current price may suggest overvaluation under the assumptions.
 - Small differences should not be overinterpreted because DCF is highly sensitive.
 
+Currency limitation:
+
+- Direct DCF-to-price comparison is only shown when quote currency and financial statement currency match.
+- If they differ, the DCF value is still shown in the financial statement currency, but it is not treated as a price target.
+- This avoids misleading ADR or cross-listing comparisons where exchange rates, depositary ratios, or share-class details may be needed.
+
 ## Risk Outputs
 
 ### Annualized Return
@@ -623,7 +659,7 @@ The scenario table gives bull, base, and bear cases.
 It combines:
 
 - Current price.
-- DCF fair value if available.
+- DCF fair value if available and price-comparable.
 - 200-day moving average.
 - ATR-based volatility bands.
 - Realized volatility.
