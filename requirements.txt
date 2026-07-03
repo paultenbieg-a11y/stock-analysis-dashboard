@@ -2,3 +2,5 @@ yfinance>=0.2.54
 pandas>=2.2.0
 numpy>=1.26.0
 plotly>=5.24.0
+lxml>=5.0  # yfinance needs it for the earnings-dates table
+# hashlib, pickle, time are stdlib — no extra install needed
