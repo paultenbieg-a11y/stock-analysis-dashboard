@@ -6,3 +6,7 @@ __pycache__/
 # Generated reports stay local. Keep the folder with reports/.gitkeep.
 reports/*
 !reports/.gitkeep
+
+# Runtime caches
+.cache/
+.pytest_cache/

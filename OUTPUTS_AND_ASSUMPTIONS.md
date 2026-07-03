@@ -31,7 +31,7 @@ Each run creates an HTML file:
 reports/<TICKER>_stock_analysis.html
 ```
 
-The file is self-contained except for Plotly being loaded from a CDN for interactive charts. Open it in a browser.
+The file is self-contained except for Plotly and the Inter font, which load from CDNs for the interactive charts and typography. Open it in a browser.
 
 Generated report files are local outputs. The project keeps the `reports` folder with `reports/.gitkeep`, but ignores generated `.html` reports in Git so old personal analyses are not published when the repository is pushed.
 
@@ -133,17 +133,19 @@ share price * shares outstanding
 
 Used as a scale indicator and for ratios such as free cash flow yield.
 
-### Period Return
+### Total Return
 
-The total price return over the selected history period.
-
-Example:
+The total return over the selected history period:
 
 ```text
-last close / first close - 1
+last adjusted close / first adjusted close - 1
 ```
 
-This is not the same as total shareholder return because dividends are not explicitly reinvested in the current version.
+Dividend-adjusted closes are used when the data source provides them, so this approximates total shareholder return. The card detail also shows the relative return against the benchmark when available.
+
+### Next Earnings
+
+Days until the next scheduled earnings date from the Yahoo Finance calendar. Treat the date as provisional until the company confirms it.
 
 ### Annual Volatility
 
@@ -598,6 +600,55 @@ Currency limitation:
 - If they differ, the DCF value is still shown in the financial statement currency, but it is not treated as a price target.
 - This avoids misleading ADR or cross-listing comparisons where exchange rates, depositary ratios, or share-class details may be needed.
 
+## DCF Sensitivity Heatmap
+
+A single fair-value number hides how assumption-driven a DCF is, so the report shows the whole neighborhood: fair value recomputed across WACC ± 2 percentage points (rows) and terminal growth ± 1 percentage point (columns).
+
+How to read it:
+
+- When the DCF is price-comparable, cells above the current price are green and cells below are red.
+- A grid that is mostly one colour is a robust signal; a grid that flips colour across plausible assumptions means the valuation verdict depends on inputs you cannot know precisely.
+- Cells where the WACC-to-terminal-growth spread would fall below 1.5 percentage points are left blank because the Gordon terminal value becomes unstable there.
+
+## Fair-Value Tornado
+
+The tornado chart varies one DCF input at a time and shows the resulting fair-value range per driver:
+
+- Free cash flow ± 10%.
+- Initial growth ± 2 percentage points.
+- Discount rate ± 1 percentage point.
+- Terminal growth ± 0.5 percentage points.
+
+Drivers are sorted by impact. Typically the discount rate dominates, which is a reminder that the DCF is as much a statement about required return as about the business.
+
+## Reverse DCF
+
+Instead of asking "what is the stock worth?", the reverse DCF asks "what growth does the current price already assume?".
+
+Holding the WACC and terminal growth fixed, it solves for the initial free-cash-flow growth rate (with the same fade schedule as the forward DCF) that reproduces the current market price. The executive view and the valuation section state this implied growth next to the model's own base assumption.
+
+Judging whether the implied growth is plausible for this specific business is usually a more robust exercise than trusting a single fair-value estimate.
+
+## Earnings vs Expectations
+
+The earnings section shows, for up to the last eight reported quarters:
+
+- Consensus EPS estimate and reported EPS as grouped bars (green when reported beat the estimate, red when it missed).
+- A table with the surprise percentage, computed as `(reported - estimate) / |estimate|`.
+
+Reported earnings dates inside the selected history window are also marked as dotted vertical lines on the price chart, so volatility around report dates is visible in context. Data availability depends on Yahoo's coverage for the ticker.
+
+## Peer Comparison
+
+The peer section compares the subject company against a peer group on trailing and forward P/E, EV/EBITDA, price/sales, margins, revenue growth, ROE, and free-cash-flow yield.
+
+- Peer metrics come from Yahoo profile fields (one light request per peer), so they can differ slightly from statement-derived figures.
+- The subject row is highlighted; peers are sorted by market capitalization.
+- A positioning sentence states the subject's percentile inside the group for key metrics.
+- The bubble chart plots revenue growth against EV/EBITDA with market cap as bubble size — the classic "what am I paying for growth?" view.
+
+The peer set comes from `PEER_MAP` in `stockanalysis/config.py` or from `--peers` on the command line. Percentiles need at least four names (subject plus three peers) to be shown.
+
 ## Risk Outputs
 
 ### Annualized Return
@@ -612,19 +663,21 @@ Standard deviation of daily returns annualized by `sqrt(252)`.
 
 Higher volatility means a wider range of possible outcomes.
 
-### Sharpe Proxy
-
-The script uses:
+### Sharpe Ratio
 
 ```text
-annualized return / annualized volatility
+(annualized return - risk-free rate) / annualized volatility
 ```
 
-This is a simplified Sharpe-like metric because it does not subtract the risk-free rate in the current implementation.
+The risk-free rate is the configured assumption (default 4.5%).
 
-### Sortino Proxy
+### Sortino Ratio
 
-Similar to Sharpe, but penalizes downside volatility instead of total volatility.
+Similar to Sharpe, but penalizes downside volatility instead of total volatility:
+
+```text
+(annualized return - risk-free rate) / annualized downside volatility
+```
 
 This can be more useful when upside volatility is not considered harmful.
 
@@ -731,16 +784,13 @@ Mixed setups require judgment. The report is meant to make those tradeoffs visib
 
 ## Free Improvements That Would Help Later
 
-The project currently works without paid APIs. If you want to improve it while staying free, the best additions would be:
+The project currently works without paid APIs. Benchmark comparison, peer comparison, watchlist mode, DCF sensitivity, and reverse DCF are already built in. If you want to improve it further while staying free, the best additions would be:
 
-- Benchmark comparison against `SPY`, `QQQ`, or a sector ETF.
-- Peer comparison against similar companies.
-- Optional free Financial Modeling Prep API key support for richer fundamentals.
-- Watchlist mode for multiple tickers.
-- CSV export of metrics.
+- A local metrics history (SQLite) so each run can show what changed since the last look, enable alerts, and support backtesting.
+- Optional free Financial Modeling Prep API key support as a fallback for richer fundamentals.
+- CSV/JSON export of the computed metrics.
 - PDF export of the final report.
-
-The highest-value improvement is benchmark and peer comparison because valuation and performance are more meaningful in context.
+- Total-return and dividend-sustainability analysis (payout vs free cash flow).
 
 ## Disclaimer
 
